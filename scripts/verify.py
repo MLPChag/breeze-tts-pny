@@ -57,6 +57,18 @@ def main():
         print(f'PASS: {mode}, actual exported game mod loader')
     if len(eyes[0]) != 55 or eyes[0] != eyes[1]:
         raise RuntimeError('Original and modded eye appearance differ')
+    user = work/('replacement-compat-'+str(time.time_ns()))
+    mods = user/'home-equestria-public/mods'; mods.mkdir(parents=True)
+    shutil.copy2(pack, mods/pack.name)
+    env = {**os.environ, 'XDG_DATA_HOME': str(user)}
+    result = subprocess.run([str(release/'HomeEquestria.x86_64'), '--headless', '--audio-driver', 'Dummy',
+        '--xr-mode', 'off', '--script', str(ROOT/'tests/replacement_compat.gd')],
+        cwd=release, env=env, capture_output=True, text=True, timeout=45)
+    log = result.stdout+result.stderr
+    (work/'replacement-compat.log').write_text(log)
+    if result.returncode or 'SCRIPT ERROR' in log or 'BREEZE_REPLACEMENT_COMPAT_DONE failures=0' not in log:
+        raise RuntimeError(log)
+    print('PASS: replacement declarations, inherited collisions, and refusal before any extension is installed')
     sys.path.insert(0, str(ROOT/'tests'))
     from fixture_server import create
     server = create()
@@ -84,7 +96,7 @@ def main():
     finally:
         server.shutdown(); server.server_close(); thread.join()
     (work/'result.json').write_text(json.dumps({'enabled': True, 'disabled': True,
-        'transport': True, 'eye_fields_match': len(eyes[0]), 'game_release': str(source)}, indent=2)+'\n')
+        'transport': True, 'replacement_compat': True, 'eye_fields_match': len(eyes[0]), 'game_release': str(source)}, indent=2)+'\n')
     print('PASS: all 55 eye mesh/shader fields match the unmodified game')
 
 

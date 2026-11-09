@@ -86,12 +86,14 @@ static func replacement_compatible(target: String) -> bool:
 			# A compiled game script: fine when it is one the shipped script inherits.
 			return path != target and info.chain.has(path) and none_added(names, info.added)
 		var source := FileAccess.get_file_as_string(path)
-		var scanned: Variant = declared(source)
+		var layout: Variant = code_layout(source)
+		if layout == null: return false
+		var scanned: Variant = declared_layout(layout)
 		if scanned == null: return false
 		names.merge(scanned)
-		var line := RegEx.create_from_string(EXTENDS_LINE).search(source)
+		var line := RegEx.create_from_string(EXTENDS_LINE).search(layout)
 		if line == null: return none_added(names, info.added) # implicitly RefCounted
-		var parent := RegEx.create_from_string(EXTENDS_TARGET).search(line.get_string().strip_edges())
+		var parent := RegEx.create_from_string(EXTENDS_TARGET).search(source.substr(line.get_start(), line.get_end() - line.get_start()).strip_edges())
 		if parent == null: return false # a relative path, an inner class or another form
 		if parent.get_string(4) != "":
 			# An engine class ends the chain; a global script class is not followed.
@@ -106,22 +108,74 @@ static func none_added(names: Dictionary, added: Array) -> bool:
 
 ## Top-level member names of a script, or null for a declaration form it cannot read.
 static func declared(source: String) -> Variant:
+	var layout: Variant = code_layout(source)
+	return declared_layout(layout) if layout != null else null
+
+## Mask comments and strings without moving character offsets. Newlines inside
+## strings are masked too, keeping a following semicolon on the same logical
+## line. A tooltip must not become a declaration or an inheritance directive.
+static func code_layout(source: String) -> Variant:
+	var result := PackedStringArray()
+	var quote := ""
+	var comment := false
+	var index := 0
+	while index < source.length():
+		var character := source[index]
+		if comment:
+			comment = character != "\n"
+			result.append(" " if comment else "\n")
+			index += 1
+		elif not quote.is_empty():
+			if source.substr(index, quote.length()) == quote:
+				result.append(" ".repeat(quote.length()))
+				index += quote.length()
+				quote = ""
+			elif character == "\\":
+				result.append(" ")
+				index += 1
+				if index >= source.length(): return null
+				result.append(" ")
+				index += 1
+			else:
+				if character == "\n" and quote.length() == 1: return null
+				result.append(" ")
+				index += 1
+		elif character == "#":
+			comment = true
+			result.append(" ")
+			index += 1
+		elif character == "\"" or character == "'":
+			quote = character.repeat(3) if source.substr(index, 3) == character.repeat(3) else character
+			result.append(" ".repeat(quote.length()))
+			index += quote.length()
+		else:
+			result.append(character)
+			index += 1
+	return "".join(result) if quote.is_empty() else null
+
+static func declared_layout(layout: String) -> Variant:
 	var names := {}
 	var annotation := RegEx.create_from_string(ANNOTATION)
-	var declaration := RegEx.create_from_string("^(?:static\\s+)?(?:func|var|const|signal|enum|class)\\s+([A-Za-z_]\\w*)")
-	for line: String in source.split("\n"):
-		var rest := line
-		var leading := annotation.search(rest)
-		while leading != null and leading.get_end() > 0:
-			rest = rest.substr(leading.get_end())
-			leading = annotation.search(rest)
-		var found := declaration.search(rest)
-		if found != null: names[found.get_string(1)] = true
-		# After its annotations a line holds a declaration, a comment or nothing;
-		# anything else (nested parentheses in an argument) is not read.
-		elif line.begins_with("@") and not (rest.strip_edges().is_empty() or rest.begins_with("#")): return null
+	var declaration := RegEx.create_from_string("^(?:static\\s+)?(func|var|const|signal|enum|class)\\s+([A-Za-z_]\\w*)")
+	var unread := RegEx.create_from_string("^(?:static\\s+)?(?:func|var|const|signal|class)\\b")
+	for line: String in layout.split("\n"):
+		if line.begins_with(" ") or line.begins_with("\t"): continue
+		for statement: String in line.split(";"):
+			var rest := statement.strip_edges()
+			var leading := annotation.search(rest)
+			while leading != null and leading.get_end() > 0:
+				rest = rest.substr(leading.get_end())
+				leading = annotation.search(rest)
+			var found := declaration.search(rest)
+			if found != null:
+				names[found.get_string(2)] = true
+				# Later statements on a function/class header belong to its body.
+				if found.get_string(1) in ["func", "class"]: break
+			# An annotation with an argument form we cannot read is refused.
+			elif statement.strip_edges().begins_with("@") and not rest.strip_edges().is_empty(): return null
+			elif unread.search(rest) != null: return null
 	# Values of unnamed enums are members too.
-	for block: RegExMatch in RegEx.create_from_string("(?m)^(?:@[^\\n]*\\s+)*enum\\s*\\{([^}]*)\\}").search_all(source):
+	for block: RegExMatch in RegEx.create_from_string("(?m)(?:^enum|;[\\t ]*enum)\\s*\\{([^}]*)\\}").search_all(layout):
 		for value: String in block.get_string(1).split(","):
 			var value_name := RegEx.create_from_string("^\\s*([A-Za-z_]\\w*)").search(value)
 			if value_name != null: names[value_name.get_string(1)] = true
