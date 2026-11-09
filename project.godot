@@ -1,0 +1,8 @@
+config_version=5
+[application]
+config/name="Breeze TTS PNY pack builder"
+config/version="0.3.0-maredev"
+config/use_custom_user_dir=true
+config/custom_user_dir_name="breeze-tts-pny-build"
+[rendering]
+renderer/rendering_method="gl_compatibility"

@@ -1,0 +1,10 @@
+diff --git a/apps/server/main.cpp b/apps/server/main.cpp
+--- a/apps/server/main.cpp
++++ b/apps/server/main.cpp
+@@ -1,5 +1,6 @@
+ #include "server.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <string>

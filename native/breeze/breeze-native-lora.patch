@@ -1,0 +1,611 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4483a66..64ed9ba 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -54,6 +54,7 @@ set(BREEZE_SOURCES
+     src/scheduler.cpp
+     src/text_split.cpp
+     src/voice.cpp
++    src/lora.cpp
+     src/model.cpp
+ )
+ 
+@@ -79,6 +80,11 @@ endfunction()
+ 
+ if(BREEZE_BUILD_TESTS)
+     enable_testing()
++    add_executable(breeze-test-lora tests/lora.cpp)
++    target_link_libraries(breeze-test-lora PRIVATE breeze_core)
++    add_test(NAME lora-cpu COMMAND breeze-test-lora)
++    add_test(NAME lora-gpu COMMAND breeze-test-lora --gpu)
++    set_tests_properties(lora-gpu PROPERTIES SKIP_RETURN_CODE 77)
+     add_executable(breeze-test-depth tests/depth_replay.cpp)
+     target_link_libraries(breeze-test-depth PRIVATE breeze_core)
+     breeze_utf8(breeze-test-depth)
+diff --git a/apps/server/main.cpp b/apps/server/main.cpp
+index 1b410b1..986878c 100644
+--- a/apps/server/main.cpp
++++ b/apps/server/main.cpp
+@@ -12,6 +12,7 @@ int main(int argc, char ** argv) {
+         printf("                     [--chunk-first N] [--chunk-max N] [--verbose]\n");
+         printf("                     [--voices-dir PATH] [--ws-port P] [--split-chars N]\n");
+         printf("                     [--cors [ORIGINS]] [--no-warmup] [--parallel N]\n");
++        printf("                     [--lora ID=adapter.gguf] (repeatable, requires --parallel 1)\n");
+         printf("\n");
+         printf("  --chunk-first  fewest frames in the first streamed chunk, lower starts sooner (default 1).\n");
+         printf("                 it goes up by itself when the gpu is too busy to stay ahead with that few\n");
+@@ -38,6 +39,7 @@ int main(int argc, char ** argv) {
+         std::string a = argv[i];
+         if (a == "--host" && i + 1 < argc) opts.host = argv[++i];
+         else if (a == "--port" && i + 1 < argc) opts.port = atoi(argv[++i]);
++        else if (a == "--lora" && i + 1 < argc) opts.loras.emplace_back(argv[++i]);
+         else if (a == "--webui") opts.webui = true;
+         else if (a == "--verbose" || a == "-v") opts.verbose = true;
+         else if (a == "--voices-dir" && i + 1 < argc) opts.voices_dir = argv[++i];
+diff --git a/apps/server/openai.cpp b/apps/server/openai.cpp
+index 75e7b28..d799bcd 100644
+--- a/apps/server/openai.cpp
++++ b/apps/server/openai.cpp
+@@ -2,6 +2,7 @@
+ #include "json.h"
+ 
+ #include <cstdint>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -91,6 +92,11 @@ std::string parse_openai_speech(const std::string & body, VoiceStore & store, in
+     if (!JParser(body).parse(root) || root.kind != JVal::Obj) return "request body must be a json object";
+ 
+     GenRequest & g = out.g;
++    if (!str_field(root, "lora", g.lora)) return "lora must be a string";
++    double depth_temp = 0;
++    if (!num_field(root, "depth_temperature", depth_temp) || !std::isfinite(depth_temp) || depth_temp < 0 || depth_temp > 2)
++        return "depth_temperature must be between 0 and 2";
++    g.depth_temperature = (float) depth_temp;
+     if (!str_field(root, "input", g.text)) return "input must be a string";
+     if (g.text.empty()) return "input is required";
+ 
+diff --git a/apps/server/server.cpp b/apps/server/server.cpp
+index d0073f3..f93cc53 100644
+--- a/apps/server/server.cpp
++++ b/apps/server/server.cpp
+@@ -1,4 +1,7 @@
+ #include "server.h"
++#include <cmath>
++#include <cstdlib>
++#include <stdexcept>
+ #include "encode.h"
+ #include "openai.h"
+ #include "voices.h"
+@@ -126,6 +129,20 @@ int run_server(const ServerOptions & opts) {
+         fprintf(stderr, "failed to load model\n");
+         return 1;
+     }
++    try {
++        if (!opts.loras.empty() && opts.parallel != 1) throw std::runtime_error("LoRA requires --parallel 1");
++        for (const auto & spec : opts.loras) {
++            const auto equal = spec.find('=');
++            if (equal == std::string::npos) throw std::runtime_error("expected --lora ID=path");
++            model.load_lora(spec.substr(0, equal), spec.substr(equal + 1));
++            printf("loaded adapter %s (%zu target matrices)\n", spec.substr(0, equal).c_str(),
++                   model.adapters.at(spec.substr(0, equal))->pairs.size());
++        }
++    } catch (const std::exception & e) {
++        fprintf(stderr, "adapter error: %s\n", e.what());
++        model.free();
++        return 1;
++    }
+     printf("backend: %s, sample rate: %d\n", model.backend.name(), model.cfg.sample_rate);
+     MimiCodec codec;
+     codec.init(model);
+@@ -179,6 +196,17 @@ int run_server(const ServerOptions & opts) {
+                         "application/json");
+     });
+ 
++    svr.Get("/v1/adapters", [&](const httplib::Request &, httplib::Response & res) {
++        std::string data = "{\"base_resident\":true,\"adapters\":[";
++        bool first = true;
++        for (const auto & entry : model.adapters) {
++            if (!first) data += ",";
++            first = false;
++            data += "{\"id\":\"" + entry.first + "\",\"targets\":" + std::to_string(entry.second->pairs.size()) + "}";
++        }
++        res.set_content(data + "]}", "application/json");
++    });
++
+     // openai clients post json to the same path, the form fields keep the native behaviour
+     const auto speak_openai = [&](const httplib::Request & req, httplib::Response & res) {
+         OpenAiSpeech o;
+@@ -189,6 +217,9 @@ int run_server(const ServerOptions & opts) {
+             res.set_content(openai_error(err), "application/json");
+             return;
+         }
++        if (!model.has_lora(o.g.lora)) {
++            res.status = 400; res.set_content(openai_error("unknown adapter"), "application/json"); return;
++        }
+         const int cost = sched.cost(o.g.cfg_scale);
+         if (!sched.try_acquire(cost)) {
+             res.status = 409;
+@@ -247,6 +278,16 @@ int run_server(const ServerOptions & opts) {
+             speak_openai(req, res);
+             return;
+         }
++        const std::string adapter_id = field(req, "lora", "");
++        if (!model.has_lora(adapter_id)) {
++            res.status = 400; res.set_content("{\"error\":\"unknown adapter\"}", "application/json"); return;
++        }
++        const std::string depth_value = field(req, "depth_temperature", "0");
++        char * depth_end = nullptr;
++        const float depth_temp = std::strtof(depth_value.c_str(), &depth_end);
++        if (depth_end == depth_value.c_str() || *depth_end || !std::isfinite(depth_temp) || depth_temp < 0 || depth_temp > 2) {
++            res.status = 400; res.set_content("{\"error\":\"invalid depth_temperature\"}", "application/json"); return;
++        }
+         const int cost = sched.cost((float) atof(field(req, "cfg_scale", "1.0").c_str()));
+         if (!sched.try_acquire(cost)) {
+             res.status = 409;
+@@ -255,6 +296,9 @@ int run_server(const ServerOptions & opts) {
+         }
+         auto slot = std::make_shared<SlotHold>(sched, cost);
+         GenRequest g;
++        g.lora = adapter_id;
++        g.depth_temperature = depth_temp;
++        res.set_header("X-Breeze-Adapter", g.lora.empty() ? "base" : g.lora);
+         g.text = field(req, "text", "");
+         g.instruction = field(req, "instruction", "Speak clearly and naturally.");
+         g.ref_text = field(req, "ref_text", "");
+diff --git a/apps/server/server.h b/apps/server/server.h
+index e82c4f4..7355a9e 100644
+--- a/apps/server/server.h
++++ b/apps/server/server.h
+@@ -1,11 +1,13 @@
+ #pragma once
+ 
+ #include <string>
++#include <vector>
+ 
+ namespace breeze {
+ 
+ struct ServerOptions {
+     std::string model;
++    std::vector<std::string> loras; // ID=path, preloaded once
+     std::string host = "127.0.0.1";
+     int port = 8080;
+     bool use_gpu = true;
+diff --git a/include/breeze/depth_decoder.h b/include/breeze/depth_decoder.h
+index c5e46dd..799e57b 100644
+--- a/include/breeze/depth_decoder.h
++++ b/include/breeze/depth_decoder.h
+@@ -20,7 +20,7 @@ struct DepthStep {
+ 
+ // every codebook step and its sampling in one graph, so a frame is a single submit and readback
+ struct DepthFused {
+-    Graph graph{16384};
++    Graph graph{32768};
+     ggml_tensor * cb0 = nullptr;
+     ggml_tensor * hidden = nullptr;
+     ggml_tensor * noise = nullptr;
+@@ -41,6 +41,7 @@ struct DepthItem {
+ 
+ // autoregressive residual decoder: predicts codebooks 1..num_codebooks-1 for one frame
+ struct DepthRunner {
++    const LoRAAdapter * lora = nullptr;
+     KVCache kv; // CFG branches share one cache, interleaved per position
+     int n_branch = 1;
+     std::vector<float> freq_factors;
+diff --git a/include/breeze/generation.h b/include/breeze/generation.h
+index ef280b6..37f5316 100644
+--- a/include/breeze/generation.h
++++ b/include/breeze/generation.h
+@@ -16,6 +16,8 @@
+ namespace breeze {
+ 
+ struct GenRequest {
++    std::string lora; // empty selects the unmodified base
++    float depth_temperature = 0.0f; // zero uses model default
+     std::string text;
+     std::string instruction = "Speak clearly and naturally.";
+     std::string ref_text;
+diff --git a/include/breeze/model.h b/include/breeze/model.h
+index cb89dbe..db6e0e7 100644
+--- a/include/breeze/model.h
++++ b/include/breeze/model.h
+@@ -4,6 +4,8 @@
+ #include "breeze/common.h"
+ #include "breeze/gguf_loader.h"
+ #include "breeze/tokenizer.h"
++#include "breeze/lora.h"
++#include <map>
+ 
+ #include <memory>
+ #include <string>
+@@ -15,6 +17,12 @@ struct BreezeModel {
+     GGUFModel gg;
+     BreezeConfig cfg;
+     Tokenizer tok;
++    std::map<std::string, std::unique_ptr<LoRAAdapter>> adapters;
++    const LoRAAdapter * active_lora = nullptr;
++    void load_lora(const std::string & id, const std::string & path);
++    bool has_lora(const std::string & id) const { return id.empty() || adapters.count(id); }
++    void select_lora(const std::string & id);
++    ggml_tensor * project(ggml_context * ctx, const std::string & name, ggml_tensor * x) const;
+ 
+     bool load(const std::string & path, bool prefer_gpu);
+     void free();
+diff --git a/src/backbone.cpp b/src/backbone.cpp
+index 3a15d23..3761f7a 100644
+--- a/src/backbone.cpp
++++ b/src/backbone.cpp
+@@ -5,13 +5,13 @@
+ 
+ namespace breeze {
+ 
+-static ggml_tensor * bb_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, bool f32_batch) {
+-    if (f32_batch && ggml_is_quantized(w->type)) {
++static ggml_tensor * bb_linear(ggml_context * ctx, BreezeModel & m, const std::string & name, ggml_tensor * x, bool f32_batch) {
++    if (f32_batch && ggml_is_quantized(m.w(name)->type)) {
+         // a row stride keeps Vulkan from quantizing batched F32 activations
+         auto * padded = ggml_pad(ctx, x, 1, 0, 0, 0);
+         x = ggml_view_2d(ctx, padded, x->ne[0], x->ne[1], padded->nb[1], 0);
+     }
+-    return linear(ctx, w, x);
++    return m.project(ctx, name, x);
+ }
+ 
+ void BackboneState::init(BreezeModel & m, int max_seq) {
+@@ -53,7 +53,7 @@ static ggml_tensor * bb_layer(ggml_context * ctx, BreezeModel & m, Graph & g, co
+     const bool batch = states.size() > 1;
+     const bool f32_batch = batch && std::string(m.backend.name()).find("Vulkan") == 0;
+     auto project = [&](const char * suffix, ggml_tensor * input) {
+-        return bb_linear(ctx, m.w(p + suffix), input, f32_batch);
++        return bb_linear(ctx, m, p + suffix, input, f32_batch);
+     };
+ 
+     ggml_tensor * res = x;
+@@ -109,7 +109,7 @@ StepOut backbone_run(BreezeModel & m, BackboneState & st, const std::vector<floa
+ 
+     ggml_tensor * last = ggml_view_2d(g.ctx, x, c.hidden, 1, x->nb[1], (size_t) (n - 1) * x->nb[1]);
+     last = ggml_cont(g.ctx, last);
+-    ggml_tensor * logits = linear(g.ctx, m.w("bb.lm_head.weight"), last);
++    ggml_tensor * logits = m.project(g.ctx, "bb.lm_head.weight", last);
+ 
+     ggml_set_output(last);
+     g.write(last);
+@@ -138,7 +138,7 @@ std::vector<StepOut> backbone_run_batch(BreezeModel & m, const std::vector<Backb
+     for (int il = 0; il < c.n_layer; il++)
+         x = bb_layer(g.ctx, m, g, states, x, il, pos, masks, rows);
+     x = rms_norm(g.ctx, x, m.w("bb.output_norm.weight"), c.rms_eps);
+-    auto * logits = bb_linear(g.ctx, m.w("bb.lm_head.weight"), x,
++    auto * logits = bb_linear(g.ctx, m, "bb.lm_head.weight", x,
+                              rows > 1 && std::string(m.backend.name()).find("Vulkan") == 0);
+     ggml_set_output(x);
+     g.write(x);
+diff --git a/src/depth_decoder.cpp b/src/depth_decoder.cpp
+index 0e3beec..0f64233 100644
+--- a/src/depth_decoder.cpp
++++ b/src/depth_decoder.cpp
+@@ -41,6 +41,7 @@ static void check_shape(ggml_tensor * t, const std::string & name,
+ void DepthRunner::init(BreezeModel & m, int n_branches) {
+     free();
+     n_branch = n_branches;
++    lora = m.active_lora;
+     const DepthConfig & c = m.cfg.dd;
+     const int nc = m.cfg.num_codebooks;
+     const int vs = m.cfg.audio_vocab_size;
+@@ -71,21 +72,21 @@ static ggml_tensor * dd_layer(ggml_context * ctx, BreezeModel & m, ggml_tensor *
+ 
+     ggml_tensor * res = x;
+     ggml_tensor * h = rms_norm(ctx, x, m.w(p + ".attn_norm.weight"), c.rms_eps);
+-    ggml_tensor * q = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_q.weight"), h), c.head_dim, c.n_head, n);
+-    ggml_tensor * k = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_k.weight"), h), c.head_dim, c.n_kv_head, n);
+-    ggml_tensor * v = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_v.weight"), h), c.head_dim, c.n_kv_head, n);
++    ggml_tensor * q = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_q.weight", h), c.head_dim, c.n_head, n);
++    ggml_tensor * k = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_k.weight", h), c.head_dim, c.n_kv_head, n);
++    ggml_tensor * v = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_v.weight", h), c.head_dim, c.n_kv_head, n);
+     q = ggml_rope_ext(ctx, q, pos, ff, c.head_dim, GGML_ROPE_TYPE_NEOX, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+     k = ggml_rope_ext(ctx, k, pos, ff, c.head_dim, GGML_ROPE_TYPE_NEOX, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+ 
+     ggml_tensor * kfull = nullptr, * vfull = nullptr;
+     kv(il, k, v, kfull, vfull);
+     ggml_tensor * a = attention(ctx, q, kfull, vfull, mask, scale, c.n_head, c.n_kv_head);
+-    a = linear(ctx, m.w(p + ".attn_output.weight"), a);
++    a = m.project(ctx, p + ".attn_output.weight", a);
+     x = ggml_add(ctx, res, a);
+ 
+     res = x;
+     h = rms_norm(ctx, x, m.w(p + ".ffn_norm.weight"), c.rms_eps);
+-    h = swiglu_ffn(ctx, h, m.w(p + ".ffn_gate.weight"), m.w(p + ".ffn_up.weight"), m.w(p + ".ffn_down.weight"));
++    h = m.project(ctx, p + ".ffn_down.weight", ggml_swiglu_split(ctx, m.project(ctx, p + ".ffn_gate.weight", h), m.project(ctx, p + ".ffn_up.weight", h)));
+     return ggml_add(ctx, res, h);
+ }
+ 
+@@ -105,7 +106,7 @@ static std::unique_ptr<DepthStep> build_depth_step(BreezeModel & m, DepthRunner
+         step->hidden = g.input_f32(std::vector<float>((size_t) nb * m.cfg.hidden_size), m.cfg.hidden_size, nb);
+         embed = ggml_concat(g.ctx, step->hidden, embed, 1);
+     }
+-    ggml_tensor * x = linear(g.ctx, m.w("dd.in_proj.weight"), embed); // [1024, n_tok]
++    ggml_tensor * x = m.project(g.ctx, "dd.in_proj.weight", embed); // [1024, n_tok]
+ 
+     std::vector<int32_t> pos_i(n_tok);
+     for (int i = 0; i < n_tok; i++) pos_i[i] = start + i / nb;
+@@ -177,7 +178,7 @@ static std::unique_ptr<DepthFused> build_depth_fused(BreezeModel & m, DepthRunne
+             ggml_tensor * table = ggml_view_2d(ctx, embd, embd->ne[0], vs, embd->nb[1], (size_t) h * vs * embd->nb[1]);
+             embed = ggml_get_rows(ctx, table, code_rows);
+         }
+-        ggml_tensor * x = linear(ctx, m.w("dd.in_proj.weight"), embed);
++        ggml_tensor * x = m.project(ctx, "dd.in_proj.weight", embed);
+ 
+         std::vector<int32_t> pos_i(n_tok);
+         for (int i = 0; i < n_tok; i++) pos_i[i] = start + i / rows;
+diff --git a/src/generation.cpp b/src/generation.cpp
+index 531291d..78ce85c 100644
+--- a/src/generation.cpp
++++ b/src/generation.cpp
+@@ -76,7 +76,7 @@ static std::vector<float> combine_logits(const std::vector<float> & cond, const
+ 
+ DepthRunner & GenPool::runner(BreezeModel & m, int branches) {
+     DepthRunner & r = depth[branches - 1];
+-    if (r.n_branch != branches || r.steps.empty()) r.init(m, branches);
++    if (r.n_branch != branches || r.steps.empty() || r.lora != m.active_lora) r.init(m, branches);
+     return r;
+ }
+ 
+@@ -118,6 +118,8 @@ static int first_chunk(const GenPool & pool, int rows, double frame_audio_ms) {
+ }
+ 
+ void SpeechJob::start(int other_rows) {
++    // Runs on the scheduler's sole GPU thread. Adapter-enabled schedulers are serial.
++    m.select_lora(req.lora);
+     const bool has_ref = !ref.codes.empty() && !ref.text.empty();
+     use_cfg = req.cfg_scale != 1.0f;
+ 
+@@ -257,7 +259,7 @@ void step_jobs(BreezeModel & m, GenPool & pool, const std::vector<SpeechJob *> &
+             items[i].hidden[1] = jobs[i]->use_cfg ? &jobs[i]->o_u.hidden : nullptr;
+             items[i].cb0 = jobs[i]->cb0;
+             items[i].cfg_scale = jobs[i]->req.cfg_scale;
+-            items[i].temperature = sp.temperature;
++            items[i].temperature = jobs[i]->req.depth_temperature > 0 ? jobs[i]->req.depth_temperature : sp.temperature;
+             items[i].rng = &jobs[i]->rng;
+         }
+         codes = pool.runner(m, 1).run_batch(m, items, top_k);
+@@ -265,7 +267,9 @@ void step_jobs(BreezeModel & m, GenPool & pool, const std::vector<SpeechJob *> &
+         for (SpeechJob * j : jobs) {
+             std::vector<std::vector<float>> hiddens = { j->o_c.hidden };
+             if (j->use_cfg) hiddens.push_back(j->o_u.hidden);
+-            codes.push_back(pool.runner(m, j->branches()).run(m, hiddens, j->cb0, j->req.cfg_scale, j->rng));
++            SampleParams params = sp;
++            if (j->req.depth_temperature > 0) params.temperature = j->req.depth_temperature;
++            codes.push_back(pool.runner(m, j->branches()).run(m, hiddens, j->cb0, j->req.cfg_scale, j->rng, &params));
+         }
+     }
+     const double depth_ms = ms_since(td);
+@@ -444,6 +448,7 @@ static std::string filler_text(double secs) {
+ std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::vector<int> & src_codes,
+                                  int src_T, const std::vector<float> & ref_audio,
+                                  const std::string & ref_text, const ConvertOptions & opt) {
++    m.select_lora(""); // conversion has no adapter selection in this API
+     const int nc = m.cfg.num_codebooks;
+     const bool use_cfg = opt.cfg_scale != 1.0f;
+     std::mt19937 rng((uint32_t) opt.seed);
+diff --git a/src/model.cpp b/src/model.cpp
+index 8351e2d..933f47b 100644
+--- a/src/model.cpp
++++ b/src/model.cpp
+@@ -1,4 +1,6 @@
+ #include "breeze/model.h"
++#include <regex>
++#include <stdexcept>
+ 
+ namespace breeze {
+ 
+@@ -10,7 +12,29 @@ bool BreezeModel::load(const std::string & path, bool prefer_gpu) {
+     return true;
+ }
+ 
++void BreezeModel::load_lora(const std::string & id, const std::string & path) {
++    if (!std::regex_match(id, std::regex("[A-Za-z0-9_-]{1,64}")) || adapters.count(id))
++        throw std::runtime_error("invalid or duplicate adapter id: " + id);
++    auto adapter = std::make_unique<LoRAAdapter>();
++    adapter->load(path, backend, gg);
++    adapters.emplace(id, std::move(adapter));
++}
++void BreezeModel::select_lora(const std::string & id) {
++    if (!has_lora(id)) throw std::runtime_error("unknown adapter: " + id);
++    active_lora = id.empty() ? nullptr : adapters.at(id).get();
++}
++ggml_tensor * BreezeModel::project(ggml_context * ctx, const std::string & name, ggml_tensor * x) const {
++    auto * out = linear(ctx, w(name), x);
++    if (!active_lora) return out;
++    const auto it = active_lora->pairs.find(name);
++    if (it == active_lora->pairs.end()) return out;
++    const auto & pair = it->second;
++    auto * delta = linear(ctx, pair.b, linear(ctx, pair.a, x));
++    return ggml_add(ctx, out, ggml_scale(ctx, delta, pair.scale));
++}
+ void BreezeModel::free() {
++    active_lora = nullptr;
++    adapters.clear();
+     gg.free();
+     backend.free();
+ }
+diff --git a/src/scheduler.cpp b/src/scheduler.cpp
+index ca0028d..795f0e4 100644
+--- a/src/scheduler.cpp
++++ b/src/scheduler.cpp
+@@ -1,11 +1,13 @@
+ #include "breeze/scheduler.h"
+ 
+ #include <algorithm>
++#include <stdexcept>
+ 
+ namespace breeze {
+ 
+ void GenScheduler::start(BreezeModel & m, int parallel) {
+     stop();
++    if (!m.adapters.empty() && parallel != 1) throw std::runtime_error("LoRA requires --parallel 1");
+     m_model = &m;
+     m_parallel = parallel < 1 ? 1 : parallel;
+     m_slots = m_parallel;
+diff --git a/src/text_encoder.cpp b/src/text_encoder.cpp
+index e42f626..d98b523 100644
+--- a/src/text_encoder.cpp
++++ b/src/text_encoder.cpp
+@@ -65,7 +65,7 @@ std::vector<float> text_encoder_forward(BreezeModel & m, const std::vector<int>
+         x = te_layer(g.ctx, m, x, il, pos, is_full ? mfull : mwin);
+     }
+     x = rms_norm(g.ctx, x, m.w("te.output_norm.weight"), c.rms_eps);
+-    x = linear(g.ctx, m.w("te.proj.weight"), x);
++    x = m.project(g.ctx, "te.proj.weight", x);
+ 
+     g.compute(m.backend, x);
+     return tensor_to_f32(x);
+diff --git a/include/breeze/lora.h b/include/breeze/lora.h
+new file mode 100644
+index 0000000..eb4379f
+--- /dev/null
++++ b/include/breeze/lora.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include "breeze/gguf_loader.h"
++#include <map>
++#include <string>
++namespace breeze {
++struct LoRAPair { ggml_tensor * a; ggml_tensor * b; float scale; };
++// Immutable after loading; tensors stay separate from the base weights.
++struct LoRAAdapter {
++    GGUFModel gg;
++    std::map<std::string, LoRAPair> pairs;
++    ~LoRAAdapter() { gg.free(); }
++    void load(const std::string & path, Backend & backend, const GGUFModel & base);
++};
++}
+diff --git a/src/lora.cpp b/src/lora.cpp
+new file mode 100644
+index 0000000..48a6621
+--- /dev/null
++++ b/src/lora.cpp
+@@ -0,0 +1,44 @@
++#include "breeze/lora.h"
++#include <cmath>
++#include <regex>
++#include <stdexcept>
++namespace breeze {
++void LoRAAdapter::load(const std::string & path, Backend & backend, const GGUFModel & base) {
++    if (gg.gguf) throw std::runtime_error("adapter already loaded");
++    if (!gg.load(path, backend)) throw std::runtime_error("cannot load adapter: " + path);
++    if (gg.kv_str("general.architecture") != "breeze-tts-2" ||
++        gg.kv_str("general.type") != "adapter" || gg.kv_str("adapter.type") != "lora" ||
++        gg.kv_u32("breeze.lora.version") != 1) throw std::runtime_error("unsupported Breeze LoRA format");
++    const int rank = gg.kv_u32("breeze.lora.rank");
++    const float alpha = gg.kv_f32("adapter.lora.alpha");
++    if (rank <= 0 || rank > 1024 || !std::isfinite(alpha) || alpha <= 0)
++        throw std::runtime_error("invalid LoRA rank or alpha");
++    const std::regex target(R"((bb|dd)\.blk\.[0-9]+\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\.weight|te\.proj\.weight|dd\.in_proj\.weight|bb\.lm_head\.weight)");
++    for (const auto & entry : gg.tensors) {
++        const std::string & name = entry.first;
++        if (name.size() < 8 || (name.substr(name.size()-7) != ".lora_a" && name.substr(name.size()-7) != ".lora_b"))
++            throw std::runtime_error("unexpected adapter tensor: " + name);
++        const std::string weight = name.substr(0, name.size()-7);
++        if (!std::regex_match(weight, target)) throw std::runtime_error("unsupported adapter target: " + weight);
++        ggml_tensor * w = base.find(weight);
++        ggml_tensor * a = gg.find(weight + ".lora_a"), * b = gg.find(weight + ".lora_b");
++        if (!w || !a || !b || w->ne[2] != 1 || w->ne[3] != 1 ||
++            a->ne[0] != w->ne[0] || a->ne[1] != rank || b->ne[0] != rank || b->ne[1] != w->ne[1] ||
++            a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1)
++            throw std::runtime_error("LoRA pair missing or incompatible with base: " + weight);
++        auto * t = entry.second;
++        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) throw std::runtime_error("LoRA tensors must be F16 or F32");
++        const size_t n = ggml_nelements(t);
++        std::vector<float> values(n);
++        if (t->type == GGML_TYPE_F32) ggml_backend_tensor_get(t, values.data(), 0, n*sizeof(float));
++        else {
++            std::vector<ggml_fp16_t> half(n);
++            ggml_backend_tensor_get(t, half.data(), 0, n*sizeof(ggml_fp16_t));
++            ggml_fp16_to_fp32_row(half.data(), values.data(), n);
++        }
++        for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("nonfinite adapter tensor: " + name);
++        pairs[weight] = {a, b, alpha / rank};
++    }
++    if (pairs.empty()) throw std::runtime_error("empty LoRA adapter");
++}
++}
+diff --git a/tests/lora.cpp b/tests/lora.cpp
+new file mode 100644
+index 0000000..bf502a6
+--- /dev/null
++++ b/tests/lora.cpp
+@@ -0,0 +1,74 @@
++#include "breeze/model.h"
++#include "breeze/scheduler.h"
++#include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <chrono>
++#include <stdexcept>
++using namespace breeze;
++static void require(bool ok, const char * msg) { if (!ok) throw std::runtime_error(msg); }
++static void adapter_file(const std::string & path, float alpha, int version = 1, bool missing = false) {
++    auto * ctx = ggml_init({ggml_tensor_overhead()*4, nullptr, false});
++    auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
++    auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 32);
++    ggml_set_name(a, "bb.lm_head.weight.lora_a"); ggml_set_name(b, "bb.lm_head.weight.lora_b");
++    for (int i=0;i<64;i++) { ((float *)a->data)[i] = (i%7-3)*0.03f; ((float *)b->data)[i] = (i%5-2)*0.04f; }
++    auto * out = gguf_init_empty();
++    gguf_set_val_str(out,"general.architecture","breeze-tts-2");
++    gguf_set_val_str(out,"general.type","adapter"); gguf_set_val_str(out,"adapter.type","lora");
++    gguf_set_val_u32(out,"breeze.lora.version",version); gguf_set_val_u32(out,"breeze.lora.rank",2);
++    gguf_set_val_f32(out,"adapter.lora.alpha",alpha);
++    gguf_add_tensor(out,a); if (!missing) gguf_add_tensor(out,b);
++    require(gguf_write_to_file(out,path.c_str(),false),"write adapter fixture");
++    gguf_free(out); ggml_free(ctx);
++}
++static std::vector<float> project(BreezeModel & m, const std::string & id) {
++    m.select_lora(id);
++    Graph g(64);
++    std::vector<float> input(32); for (int i=0;i<32;i++) input[i]=(i%9-4)*0.1f;
++    auto * x=g.input_f32(input,32);
++    auto * y=m.project(g.ctx,"bb.lm_head.weight",x); g.compute(m.backend,y);
++    return tensor_to_f32(y);
++}
++static void close(const std::vector<float> & a,const std::vector<float> & b,float eps=1e-5f) {
++    require(a.size()==b.size(),"wrong shape");
++    for(size_t i=0;i<a.size();i++) require(std::isfinite(a[i]) && std::abs(a[i]-b[i])<=eps,"LoRA math or restoration mismatch");
++}
++int main(int argc,char ** argv) {
++    const bool gpu=argc>1 && std::string(argv[1])=="--gpu";
++    BreezeModel m; m.backend.init(gpu);
++    if(gpu && !m.backend.is_gpu) { m.free();return 77; }
++    auto dir=std::filesystem::temp_directory_path()/("breeze-lora-test-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    std::filesystem::create_directory(dir);
++    try {
++        m.gg.meta=ggml_init({ggml_tensor_overhead()*4,nullptr,true});
++        auto * w=ggml_new_tensor_2d(m.gg.meta,GGML_TYPE_F32,32,32);
++        m.gg.tensors["bb.lm_head.weight"]=w;
++        m.gg.buffer=ggml_backend_alloc_ctx_tensors(m.gg.meta,m.backend.backend);
++        std::vector<float> weights(1024);for(int i=0;i<1024;i++)weights[i]=(i%11-5)*0.02f;
++        ggml_backend_tensor_set(w,weights.data(),0,weights.size()*sizeof(float));
++        adapter_file((dir/"a.gguf").string(),4);adapter_file((dir/"b.gguf").string(),8);
++        m.load_lora("a",(dir/"a.gguf").string());m.load_lora("b",(dir/"b.gguf").string());
++        const auto base=project(m,"");std::vector<float> expected=base;
++        float ax[2]={};
++        for(int r=0;r<2;r++)for(int i=0;i<32;i++)ax[r]+=((r*32+i)%7-3)*0.03f*(i%9-4)*0.1f;
++        for(int o=0;o<32;o++)for(int r=0;r<2;r++)expected[o]+=2*((o*2+r)%5-2)*0.04f*ax[r];
++        for(int i=0;i<5;i++) {
++            close(project(m,"a"),expected);
++            auto twice=base;for(int o=0;o<32;o++)twice[o]+=2*(expected[o]-base[o]);
++            close(project(m,"b"),twice);close(project(m,""),base,0);
++        }
++        std::vector<float> after(1024);ggml_backend_tensor_get(w,after.data(),0,after.size()*sizeof(float));
++        close(after,weights,0);
++        bool rejected=false;try{m.select_lora("missing");}catch(const std::runtime_error &){rejected=true;}
++        require(rejected,"unknown id accepted");
++        rejected=false;try{GenScheduler sched;sched.start(m,2);}catch(const std::runtime_error &){rejected=true;}
++        require(rejected,"concurrent adapters accepted");
++        for(int kind=0;kind<3;kind++) {
++            adapter_file((dir/"bad.gguf").string(),kind==2?NAN:4,kind==0?9:1,kind==1);
++            rejected=false;try{m.load_lora("bad",(dir/"bad.gguf").string());}catch(const std::runtime_error &){rejected=true;}
++            require(rejected,"invalid adapter accepted");require(!m.has_lora("bad"),"failed load leaked registry entry");
++        }
++        m.free();std::filesystem::remove_all(dir);printf("LoRA numerical, selection, base-restoration and rejection checks passed\n");return 0;
++    }catch(const std::exception & e){fprintf(stderr,"%s\n",e.what());m.free();std::filesystem::remove_all(dir);return 1;}
++}

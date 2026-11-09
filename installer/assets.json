@@ -1,0 +1,8 @@
+{
+  "breeze_q8": {
+    "file": "breeze-tts-2-q8_0.gguf",
+    "url": "https://huggingface.co/HoppouAI/Breeze-TTS-2.cpp/resolve/81b22bad9f05b99970e30c5ee5e4bbc52fedf2f8/breeze-tts-2-q8_0.gguf",
+    "sha256": "a02bcc4b69b0601032727f8040c4942149b1b73aa0f69022fe5aaa6a8f0ef879",
+    "license": "https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE"
+  }
+}

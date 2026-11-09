@@ -1,0 +1,8 @@
+[configuration]
+entry_symbol = "talking_avatar_library_init"
+compatibility_minimum = "4.5"
+reloadable = false
+
+[libraries]
+linux.x86_64 = "libtalking_avatar.so"
+windows.x86_64 = "libtalking_avatar.dll"
