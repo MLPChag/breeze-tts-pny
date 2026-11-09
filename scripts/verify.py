@@ -11,6 +11,7 @@ import sys
 import threading
 
 ROOT = Path(__file__).resolve().parents[1]
+MOD_VERSION = json.loads((ROOT/'mods/breeze_tts_pny/mod.json').read_text())['version']
 
 
 def main():
@@ -29,7 +30,7 @@ def main():
         if dest.exists(): continue
         if name.endswith('.pck'): dest.symlink_to(source/name)
         else: shutil.copy2(source/name, dest)
-    pack = ROOT/'dist/breeze_tts_pny-0.1.0-linux-x86_64.pck'
+    pack = ROOT/f'dist/breeze_tts_pny-{MOD_VERSION}-linux-x86_64.pck'
     eyes = []
     for mode in ['enabled', 'disabled']:
         user = work/(mode+'-'+str(time.time_ns()))
@@ -74,12 +75,12 @@ def main():
         (work/'transport.log').write_text(log)
         if result.returncode or 'SCRIPT ERROR' in log or 'BREEZE_TRANSPORT_DONE failures=0' not in log:
             raise RuntimeError(log)
-        expected = ['stream_fixture', 'wav_fixture', 'corrupt_fixture', 'spike', 'cancel_fixture', None, 'lily_valley']
+        expected = ['stream_fixture', 'wav_fixture', 'corrupt_fixture', 'spike', 'cancel_fixture', None, 'lily_valley', 'stream_fixture']
         if [r['character_id'] for r in server.requests] != expected:
             raise RuntimeError('Identity routing mismatch: '+str(server.requests))
         if server.warming_probes != 2:
             raise RuntimeError('Capability retry did not recover from the warming router')
-        print('PASS: capability detection/recovery, Lily identity routing, live PCM, Spike director handoff, WAV fallback, corruption, cancellation, legacy server')
+        print('PASS: capability detection/recovery, Lily identity routing, live PCM, Spike director handoff, WAV fallback, corruption, cancellation, legacy server, prebuffer hint')
     finally:
         server.shutdown(); server.server_close(); thread.join()
     (work/'result.json').write_text(json.dumps({'enabled': True, 'disabled': True,
